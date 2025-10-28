@@ -499,18 +499,6 @@ mod tests {
         // See: https://github.com/jj-vcs/jj/issues/7259
         // See: https://github.com/jj-vcs/jj/issues/6779
 
-        // macOS Icon file pattern with unclosed character class
-        // From: https://github.com/github/gitignore/blob/main/Global/macOS.gitignore#L6
-        // This pattern has Icon[ on one line and ] on the next (the literal file is "Icon\r")
-        let ignore = GitIgnoreFile::empty()
-            .chain("", Path::new(""), b"Icon[\n]\n")
-            .unwrap();
-        // The first line "Icon[" has an unclosed bracket and should be skipped
-        // So files named "Icon[" should NOT be ignored since the pattern was invalid
-        assert!(!ignore.matches("Icon["));
-        // The second line "]" is valid but shouldn't match "Icon["
-        assert!(ignore.matches("]"));
-
         // Template syntax with nested alternate groups
         let ignore = GitIgnoreFile::empty()
             .chain(

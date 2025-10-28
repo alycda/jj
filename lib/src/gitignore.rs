@@ -497,10 +497,12 @@ mod tests {
 
         // macOS Icon file pattern with unclosed character class
         // From: https://github.com/github/gitignore/blob/main/Global/macOS.gitignore#L6
+        // This pattern has Icon[ on one line and ] on the next (the literal file is "Icon\r")
         let ignore = GitIgnoreFile::empty()
             .chain("", Path::new(""), b"Icon[\n]\n")
             .unwrap();
-        // The malformed pattern should be skipped, so it shouldn't match anything
+        // The first line has an unclosed bracket which should be skipped
+        // The second line is just "]" which is valid and shouldn't match our test file
         assert!(!ignore.matches("Icon["));
 
         // Template syntax with nested alternate groups

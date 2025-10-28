@@ -82,12 +82,22 @@ impl GitIgnoreFile {
             // The `from` argument doesn't provide any diagnostics or correctness, so it is
             // not required. It only allows retrieving the path from the `Glob` later, which
             // we never do.
-            builder
-                .add_line(None, line)
-                .map_err(|err| GitIgnoreError::Underlying {
-                    path: ignore_path.to_path_buf(),
-                    source: err,
-                })?;
+            //
+            // Gracefully skip invalid patterns like Git does, rather than failing the entire
+            // operation. This matches Git's behavior of ignoring malformed patterns.
+            // See: https://github.com/jj-vcs/jj/issues/7710
+            // See: https://github.com/jj-vcs/jj/issues/7259
+            // See: https://github.com/jj-vcs/jj/issues/6779
+            if let Err(_err) = builder.add_line(None, line) {
+                // Silently skip invalid patterns to match Git's behavior
+                tracing::debug!(
+                    "Ignoring invalid pattern in {}:{}: {}",
+                    ignore_path.display(),
+                    i + 1,
+                    line
+                );
+                continue;
+            }
         }
         let matcher = builder.build().map_err(|err| GitIgnoreError::Underlying {
             path: ignore_path.to_path_buf(),
@@ -475,5 +485,59 @@ mod tests {
         // Test without the leading #
         let ignore = GitIgnoreFile::empty().chain("", Path::new(""), &non_ascii_bytes[1..]);
         assert!(ignore.is_err());
+    }
+
+    #[test]
+    fn test_gitignore_malformed_patterns() {
+        // Test that malformed patterns are gracefully skipped like Git does
+        // instead of causing the entire operation to fail.
+        // See: https://github.com/jj-vcs/jj/issues/7710
+        // See: https://github.com/jj-vcs/jj/issues/7259
+        // See: https://github.com/jj-vcs/jj/issues/6779
+
+        // macOS Icon file pattern with unclosed character class
+        // From: https://github.com/github/gitignore/blob/main/Global/macOS.gitignore#L6
+        let ignore = GitIgnoreFile::empty()
+            .chain("", Path::new(""), b"Icon[\n]\n")
+            .unwrap();
+        // The malformed pattern should be skipped, so it shouldn't match anything
+        assert!(!ignore.matches("Icon["));
+
+        // Template syntax with nested alternate groups
+        let ignore = GitIgnoreFile::empty()
+            .chain(
+                "",
+                Path::new(""),
+                b".flutter-plugins-dependencies{{/plugins}}{{#flutter}}\n",
+            )
+            .unwrap();
+        // The malformed pattern should be skipped
+        assert!(!ignore.matches(".flutter-plugins-dependencies"));
+
+        // Dangling backslash at end of line
+        let ignore = GitIgnoreFile::empty()
+            .chain("", Path::new(""), b"foo.csv\\\n")
+            .unwrap();
+        // The malformed pattern should be skipped
+        assert!(!ignore.matches("foo.csv"));
+
+        // Complex malformed pattern from KSyntaxHighlighting test data
+        let ignore = GitIgnoreFile::empty()
+            .chain(
+                "",
+                Path::new(""),
+                b"/**/a?[a-z12!][]][!][:upper:]][^[=a=]]\\?[\\\\incomplete?*\n",
+            )
+            .unwrap();
+        // The malformed pattern should be skipped
+        assert!(!ignore.matches("test"));
+
+        // Valid patterns should still work after skipping invalid ones
+        let ignore = GitIgnoreFile::empty()
+            .chain("", Path::new(""), b"Icon[\n]\nvalid_pattern\n*.o\n")
+            .unwrap();
+        assert!(ignore.matches("valid_pattern"));
+        assert!(ignore.matches("test.o"));
+        assert!(!ignore.matches("test.c"));
     }
 }

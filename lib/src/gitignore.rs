@@ -285,10 +285,12 @@ mod tests {
         assert!(matches(b"\\?\n", "?"));
         assert!(!matches(b"\\?\n", "x"));
         assert!(matches(b"\\w\n", "w"));
+        // Dangling backslash is now silently skipped instead of erroring
+        // to match Git's behavior (see issues #7710, #7259, #6779)
         assert!(
             GitIgnoreFile::empty()
                 .chain("", Path::new(""), b"\\\n")
-                .is_err()
+                .is_ok()
         );
     }
 

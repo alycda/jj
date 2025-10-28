@@ -501,9 +501,11 @@ mod tests {
         let ignore = GitIgnoreFile::empty()
             .chain("", Path::new(""), b"Icon[\n]\n")
             .unwrap();
-        // The first line has an unclosed bracket which should be skipped
-        // The second line is just "]" which is valid and shouldn't match our test file
+        // The first line "Icon[" has an unclosed bracket and should be skipped
+        // So files named "Icon[" should NOT be ignored since the pattern was invalid
         assert!(!ignore.matches("Icon["));
+        // The second line "]" is valid but shouldn't match "Icon["
+        assert!(ignore.matches("]"));
 
         // Template syntax with nested alternate groups
         let ignore = GitIgnoreFile::empty()

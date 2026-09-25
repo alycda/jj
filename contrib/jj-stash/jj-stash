@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Park commit chains out of every jj UI, and bring them back unchanged.
 #
-#   jj-stash push NAME REVSET   park REVSET (must include its own descendants)
+#   jj-stash push NAME REVSET   park REVSET; children outside it are detached
 #   jj-stash list               parked chains, one line each
 #   jj-stash show NAME          the plaintext file (also readable in the editor)
 #   jj-stash pop NAME           bring the chain back and drop the stash
@@ -11,7 +11,8 @@
 #                         plaintext: every commit's description and full diff,
 #                         oldest first, with the parents it sat on. For reading
 #                         before deciding, and a fallback patch.
-#   refs/stash/NAME/*     git refs on the chain's roots, heads and bookmarks.
+#   refs/jj-stash/NAME/*  git refs on the chain's roots, heads and bookmarks,
+#                         and on the chain commits each detached child lost.
 #                         jj does not import refs outside refs/heads and
 #                         refs/tags, so the commits are invisible to jj log,
 #                         VisualJJ and jjk; the refs keep git gc from pruning
@@ -50,28 +51,45 @@ ensure_excluded() {
   printf '\n# jj-stash plaintext\n.claude/stashes/\n' >>"$GIT_DIR/info/exclude"
 }
 
-refs_of() { git for-each-ref --format='%(objectname) %(refname)' "refs/stash/$1/$2"; }
+# Bookmark-list template prefix: local, non-conflicted bookmarks only. A remote
+# that is tracked but was never pushed lists as name@origin with no target.
+local_bm='if(remote || conflict, "", '
+
+# A pattern with no glob is a prefix match, so bookmark/ also finds names with
+# slashes (issue/134); a trailing * would match one path component only.
+refs_of() { git for-each-ref --format='%(objectname) %(refname)' "refs/jj-stash/$1/$2"; }
 
 push() {
   local name=$1 revset=$2
   [[ $name =~ ^[A-Za-z0-9._-]+$ ]] || die "name must be [A-Za-z0-9._-]"
-  [ -z "$(git for-each-ref "refs/stash/$name/")" ] || die "a stash named $name already exists"
+  [ -z "$(git for-each-ref "refs/jj-stash/$name/")" ] || die "a stash named $name already exists"
 
   local count
   count=$(J log -r "$revset" --no-graph -T '"x\n"' | wc -l | tr -d ' ')
   [ "$count" -gt 0 ] || die "$revset is empty"
 
-  # Abandoning a commit whose child is not also abandoned rebases the child.
-  # A stash must never rewrite what it leaves behind, so refuse.
-  local stray
-  stray=$(J log -r "children($revset) ~ ($revset)" --no-graph \
-    -T 'change_id.short() ++ " " ++ description.first_line() ++ "\n"')
-  [ -z "$stray" ] || die "$revset leaves children behind; add them or narrow it:
+  # A child outside the chain (typically a merge that collects several lanes)
+  # stays, minus the chain: it is rebased onto its other parents now and gets
+  # the chain back as parents on pop. A child with no parent outside the chain
+  # has nowhere to go, so refuse: park it too, or narrow the revset.
+  local stray child keep
+  for child in $(J log -r "children($revset) ~ ($revset)" --no-graph -T 'commit_id ++ "\n"'); do
+    keep=$(J log -r "parents($child) ~ ($revset)" --no-graph -T '"x"')
+    [ -n "$keep" ] || stray+=$(J log -r "$child" --no-graph \
+      -T 'change_id.short() ++ " " ++ description.first_line() ++ "\n"')
+  done
+  [ -z "${stray:-}" ] || die "$revset would leave these with no parent; add them or narrow it:
 $stray"
   local wc
   wc=$(J log -r "($revset) & working_copies()" --no-graph -T 'working_copies ++ "\n"')
   [ -z "$wc" ] || die "$revset contains a working copy ($wc); move it off first"
   J log -r "($revset) & immutable()" --no-graph -T '"x"' | grep -q x && die "$revset contains immutable commits"
+
+  # All or nothing: until the chain is abandoned, any failure restores the
+  # operation this started from and removes what was written.
+  local op0
+  op0=$(J op log --limit 1 --no-graph -T 'id')
+  trap 'J op restore "'"$op0"'" >/dev/null 2>&1; git for-each-ref --format="%(refname)" "refs/jj-stash/'"$name"'/" | xargs -n1 git update-ref -d 2>/dev/null; rm -f "'"$stash_dir/$name.md"'"; printf "jj-stash: push failed; restored the repo to where it was\n" >&2' EXIT
 
   ensure_excluded
   mkdir -p "$stash_dir"
@@ -87,7 +105,10 @@ $stray"
     J log -r "roots($revset)-" --no-graph \
       -T '"- " ++ change_id.short() ++ " " ++ description.first_line() ++ "\n"'
     printf '\n## Bookmarks\n\n'
-    J bookmark list -r "$revset" -T '"- " ++ name ++ "\n"' 2>/dev/null || true
+    J bookmark list -r "$revset" -T "$local_bm"'"- " ++ name ++ "\n")' 2>/dev/null || true
+    printf '\n## Detached from (these stay; pop adds the chain back as a parent)\n\n'
+    J log -r "children($revset) ~ ($revset)" --no-graph \
+      -T '"- " ++ change_id.short() ++ " " ++ description.first_line() ++ "\n"'
     printf '\n## Commits, oldest first\n'
     local c
     for c in $(J log -r "$revset" --reversed --no-graph -T 'commit_id ++ "\n"'); do
@@ -101,22 +122,39 @@ $stray"
 
   local c i=0
   for c in $(J log -r "roots($revset)" --no-graph -T 'commit_id ++ "\n"'); do
-    git update-ref "refs/stash/$name/root-$((i++))" "$c"
+    git update-ref "refs/jj-stash/$name/root-$((i++))" "$c"
   done
   i=0
   for c in $(J log -r "heads($revset)" --no-graph -T 'commit_id ++ "\n"'); do
-    git update-ref "refs/stash/$name/head-$((i++))" "$c"
+    git update-ref "refs/jj-stash/$name/head-$((i++))" "$c"
   done
-  J bookmark list -r "$revset" -T 'name ++ " " ++ normal_target.commit_id() ++ "\n"' 2>/dev/null |
-    while read -r b c; do git update-ref "refs/stash/$name/bookmark/$b" "$c"; done
+  J bookmark list -r "$revset" -T "$local_bm"'name ++ " " ++ normal_target.commit_id() ++ "\n")' 2>/dev/null |
+    while read -r b c; do git update-ref "refs/jj-stash/$name/bookmark/$b" "$c"; done
+
+  # Detach outside children. The ref path carries the child's change ID; each
+  # ref points at a chain commit that was one of its parents.
+  local p args chg
+  for child in $(J log -r "children($revset) ~ ($revset)" --no-graph -T 'commit_id ++ "\n"'); do
+    chg=$(J log -r "$child" --no-graph -T 'change_id')
+    i=0
+    for p in $(J log -r "parents($child) & ($revset)" --no-graph -T 'commit_id ++ "\n"'); do
+      git update-ref "refs/jj-stash/$name/reattach/$chg/$((i++))" "$p"
+    done
+    args=()
+    for p in $(git log -1 --format=%P "$child"); do
+      J log -r "$p & ($revset)" --no-graph -T '"x"' | grep -q x || args+=(-o "$p")
+    done
+    J rebase -s "$child" "${args[@]}" >/dev/null
+  done
 
   J abandon "$revset" >/dev/null
+  trap - EXIT
   printf 'parked %s commits as %s\n  read: %s\n' "$count" "$name" "${file#"$main_root"/}"
 }
 
 pop() {
   local name=$1
-  [ -n "$(git for-each-ref "refs/stash/$name/")" ] || die "no stash named $name"
+  [ -n "$(git for-each-ref "refs/jj-stash/$name/")" ] || die "no stash named $name"
 
   # 1. Before anything is revived, note the current version of every parent
   #    the roots sat on. Reviving brings the old versions back too, and then
@@ -166,19 +204,40 @@ pop() {
   # 4. Bookmarks, by change ID so they follow a rebase.
   local c b
   while read -r c ref; do
-    b=${ref#"refs/stash/$name/bookmark/"}
+    b=${ref#"refs/jj-stash/$name/bookmark/"}
     ch=$(git cat-file -p "$c" | sed -n 's/^change-id //p')
     J bookmark set "$b" -r "change_id($ch)" --allow-backwards >/dev/null
-  done < <(refs_of "$name" 'bookmark/*')
+  done < <(refs_of "$name" 'bookmark/')
 
-  git for-each-ref --format='%(refname)' "refs/stash/$name/" | xargs -n1 git update-ref -d
+  # 5. Reattach: children that were detached from the chain get it back as
+  #    parents, appended after their current ones. Skipped, with a note, if the
+  #    child has been abandoned since.
+  local chgs parent_chg args
+  chgs=$(git for-each-ref --format='%(refname)' "refs/jj-stash/$name/reattach/" |
+    sed "s#refs/jj-stash/$name/reattach/##; s#/[0-9]*\$##" | sort -u)
+  for chg in $chgs; do
+    child=$(J log -r "present(change_id($chg)) ~ hidden()" --no-graph -T 'commit_id' 2>/dev/null || true)
+    if [ -z "$child" ]; then
+      printf 'jj-stash: %s no longer exists; not reattached\n' "$chg" >&2
+      continue
+    fi
+    args=()
+    for p in $(J log -r "parents($child)" --no-graph -T 'commit_id ++ "\n"'); do args+=(-o "$p"); done
+    while read -r c _; do
+      parent_chg=$(git cat-file -p "$c" | sed -n 's/^change-id //p')
+      args+=(-o "change_id($parent_chg)")
+    done < <(refs_of "$name" "reattach/$chg/*")
+    J rebase -s "$child" "${args[@]}" >/dev/null
+  done
+
+  git for-each-ref --format='%(refname)' "refs/jj-stash/$name/" | xargs -n1 git update-ref -d
   rm -f "$stash_dir/$name.md"
   printf 'restored %s\n' "$name"
 }
 
 list() {
   local n
-  for n in $(git for-each-ref --format='%(refname)' 'refs/stash/*/head-0' | sed 's#refs/stash/##; s#/head-0##'); do
+  for n in $(git for-each-ref --format='%(refname)' 'refs/jj-stash/*/head-0' | sed 's#refs/jj-stash/##; s#/head-0##'); do
     printf '%-24s %s\n' "$n" "$(sed -n 's/^- commits: /commits: /p; s/^- parked: /parked: /p' "$stash_dir/$n.md" 2>/dev/null | paste -sd' ' -)"
   done
 }

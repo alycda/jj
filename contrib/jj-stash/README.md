@@ -28,10 +28,24 @@ Two things are written, then the chain is abandoned:
   workspace `push` runs from, and must be ignored or jj would snapshot it into
   `@`: if nothing ignores `.claude/stashes/`, the script adds it to
   `.git/info/exclude`.
-- **`refs/stash/NAME/{root-N,head-N,bookmark/<name>}`, git refs.** These keep
+- **`refs/jj-stash/NAME/{root-N,head-N,bookmark/<name>,reattach/<change>/N}`,
+  git refs.** These keep
   the commits alive. jj imports only `refs/heads`, `refs/tags` and
   `refs/remotes`, so these refs do not make anything visible, but git's gc
-  treats them as roots and never prunes the objects.
+  treats them as roots and never prunes the objects. The namespace is not
+  `refs/stash/`: `git stash` keeps its own data in the single ref
+  `refs/stash`, and git cannot hold both `refs/stash` and `refs/stash/…`, so
+  in a colocated repo one of the two tools would break.
+
+A child outside the chain is **detached, not stranded**. The typical case is a
+merge that collects several lanes. The child is rebased onto its other
+parents, and a `reattach/<child change ID>/N` ref records which chain commits
+were its parents. `pop` adds them back. A child with no parent outside the
+chain has nowhere to go, so `push` refuses and names it.
+
+`push` is all or nothing. It records the operation it started from, and any
+failure before the final abandon restores that operation and removes the refs
+and plaintext it wrote.
 
 `jj abandon` then removes the chain from the view. It is gone from `jj log`,
 VisualJJ and jjk.
@@ -67,12 +81,16 @@ IDs and timestamps all survive, and an export/replay step is unnecessary.
 4. **Clean up.** Step 2 also revived the *old* version of any rewritten parent.
    Once the chain has moved off it, that copy has no children and duplicates a
    live change, so it is abandoned. Nothing else is touched.
-5. **Restore bookmarks** by change ID, so they follow a rebase.
-6. **Delete the refs and the plaintext.**
+5. **Restore bookmarks** by change ID, so they follow a rebase. Only local,
+   non-conflicted bookmarks are recorded. A remote that is tracked but was
+   never pushed is listed as `name@origin` with no target, and is skipped.
+6. **Reattach** each detached child: its current parents, then the chain
+   commits it lost, in that order.
+7. **Delete the refs and the plaintext.**
 
-`push` refuses a revset that would strand a child (abandoning a commit whose
-child is not abandoned rebases the child), one that contains any workspace's
-working-copy commit, and one that contains immutable commits.
+`push` refuses a revset that would leave a child with no parent, one that
+contains any workspace's working-copy commit, and one that contains immutable
+commits.
 
 ## Tested
 
@@ -81,7 +99,9 @@ three workspaces):
 
 | case | result |
 |---|---|
-| revset that strands a child | refused, naming the child |
+| revset that would leave a child with no parent | refused, naming the child |
+| a two-commit lane whose tip is one of 25 parents of a merge (real case: an issue lane under a "merge: issue lanes for review" commit) | lane hidden; merge kept with 24 parents; pop restores identical lane IDs, the merge's 25th parent and the `issue/134` bookmark |
+| failure injected after the merge was detached, before abandon | op restored: merge back to 25 parents, no refs or plaintext left |
 | push, then pop, parents unchanged | identical change IDs **and** commit IDs; bookmark restored; no refs or plaintext left |
 | a parent rewritten while parked | root rebased onto the new version; stale copy abandoned; no divergent commits; thread count unchanged |
 | `jj util gc --expire now` then `git gc --prune=now`, while parked | objects survive; pop works |
@@ -92,16 +112,29 @@ three workspaces):
 
 - **bash 4 or later.** `pop` uses an associative array. macOS's `/bin/bash`
   is 3.2.
-- **Local only.** `jj git push` does not push `refs/stash/*`, so a stash exists
+- **Local only.** `jj git push` does not push `refs/jj-stash/*`, so a stash exists
   in one repo. Back up `.claude/stashes/` if it matters.
 - **Pushed bookmarks are not handled.** A remote bookmark (`name@origin`) keeps
   its commit visible, so a chain carrying one cannot be hidden this way.
   `abandon` also deletes the local bookmark, and a later `jj git push --deleted`
   would push that deletion. Only local bookmarks were tested.
+- **Parent order of a reattached merge** is not preserved: the chain's
+  commits are appended after the child's current parents.
 - **Merges inside the chain.** Only the roots' parents are re-targeted. If a
   merge commit inside the chain has a parent outside it, and that parent is
   rewritten while parked, the old version of that parent comes back.
 - **Conflicted bookmarks** (more than one target) are not recorded.
+
+## Found by testing
+
+- `jj bookmark list -r` also returns remote-tracking entries. An unpushed
+  tracked remote has no target, and the first version passed that non-commit
+  to `git update-ref`.
+- `git for-each-ref 'bookmark/*'` matches one path component, so `issue/134`
+  was parked but not restored. A glob-free prefix fixed it.
+- An ignore check run relative to a secondary workspace under
+  `.claude/worktrees/` matched that directory's own ignore rule. The plaintext
+  then went unignored and jj snapshotted it.
 
 ## If this became `jj stash`
 

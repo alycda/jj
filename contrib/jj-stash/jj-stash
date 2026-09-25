@@ -1,0 +1,192 @@
+#!/usr/bin/env bash
+# Park commit chains out of every jj UI, and bring them back unchanged.
+#
+#   jj-stash push NAME REVSET   park REVSET (must include its own descendants)
+#   jj-stash list               parked chains, one line each
+#   jj-stash show NAME          the plaintext file (also readable in the editor)
+#   jj-stash pop NAME           bring the chain back and drop the stash
+#
+# A parked chain is two things:
+#   .claude/stashes/NAME.md
+#                         plaintext: every commit's description and full diff,
+#                         oldest first, with the parents it sat on. For reading
+#                         before deciding, and a fallback patch.
+#   refs/stash/NAME/*     git refs on the chain's roots, heads and bookmarks.
+#                         jj does not import refs outside refs/heads and
+#                         refs/tags, so the commits are invisible to jj log,
+#                         VisualJJ and jjk; the refs keep git gc from pruning
+#                         them. jj writes a change-id header into every git
+#                         commit, so pop restores the SAME commits: same change
+#                         IDs, same commit IDs unless a parent was rewritten
+#                         while parked, in which case the root is rebased onto
+#                         the parent's current version.
+#
+# The plaintext lives in the MAIN repo's root, whichever workspace this runs
+# from, and must be ignored or jj would snapshot it into @. If nothing ignores
+# .claude/stashes/ yet, it is added to .git/info/exclude (local only); a
+# committed .gitignore entry works just as well and is left alone.
+set -euo pipefail
+
+J() { jj --no-pager "$@"; }
+die() { printf 'jj-stash: %s\n' "$*" >&2; exit 1; }
+
+# Resolve the repo the way jj does, so this works from a secondary workspace
+# (which has no .git of its own): the workspace's .jj/repo is either the repo
+# or a relative pointer to it, and the store's git_target points at the git
+# directory. The main root is the directory holding .jj/repo.
+ws_root=$(J workspace root)
+repo=$ws_root/.jj/repo
+[ -f "$repo" ] && repo=$(cd "$ws_root/.jj" && cd "$(cat repo)" && pwd)
+main_root=$(dirname "$(dirname "$repo")")
+export GIT_DIR GIT_WORK_TREE=$main_root
+GIT_DIR=$(cd "$repo/store" && cd "$(cat git_target)" && pwd)
+stash_dir="$main_root/.claude/stashes"
+
+ensure_excluded() {
+  # From the main root: run relative to a secondary workspace nested under
+  # .claude/worktrees/, the probe would match that directory's ignore rule.
+  (cd "$main_root" && git check-ignore -q .claude/stashes/probe.md) && return
+  mkdir -p "$GIT_DIR/info"
+  printf '\n# jj-stash plaintext\n.claude/stashes/\n' >>"$GIT_DIR/info/exclude"
+}
+
+refs_of() { git for-each-ref --format='%(objectname) %(refname)' "refs/stash/$1/$2"; }
+
+push() {
+  local name=$1 revset=$2
+  [[ $name =~ ^[A-Za-z0-9._-]+$ ]] || die "name must be [A-Za-z0-9._-]"
+  [ -z "$(git for-each-ref "refs/stash/$name/")" ] || die "a stash named $name already exists"
+
+  local count
+  count=$(J log -r "$revset" --no-graph -T '"x\n"' | wc -l | tr -d ' ')
+  [ "$count" -gt 0 ] || die "$revset is empty"
+
+  # Abandoning a commit whose child is not also abandoned rebases the child.
+  # A stash must never rewrite what it leaves behind, so refuse.
+  local stray
+  stray=$(J log -r "children($revset) ~ ($revset)" --no-graph \
+    -T 'change_id.short() ++ " " ++ description.first_line() ++ "\n"')
+  [ -z "$stray" ] || die "$revset leaves children behind; add them or narrow it:
+$stray"
+  local wc
+  wc=$(J log -r "($revset) & working_copies()" --no-graph -T 'working_copies ++ "\n"')
+  [ -z "$wc" ] || die "$revset contains a working copy ($wc); move it off first"
+  J log -r "($revset) & immutable()" --no-graph -T '"x"' | grep -q x && die "$revset contains immutable commits"
+
+  ensure_excluded
+  mkdir -p "$stash_dir"
+  local file="$stash_dir/$name.md"
+
+  {
+    printf '# stash: %s\n\n' "$name"
+    printf -- '- parked: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf -- '- revset: `%s`\n' "$revset"
+    printf -- '- commits: %s\n' "$count"
+    printf -- '- restore: `jj-stash pop %s`\n\n' "$name"
+    printf '## Sits on\n\n'
+    J log -r "roots($revset)-" --no-graph \
+      -T '"- " ++ change_id.short() ++ " " ++ description.first_line() ++ "\n"'
+    printf '\n## Bookmarks\n\n'
+    J bookmark list -r "$revset" -T '"- " ++ name ++ "\n"' 2>/dev/null || true
+    printf '\n## Commits, oldest first\n'
+    local c
+    for c in $(J log -r "$revset" --reversed --no-graph -T 'commit_id ++ "\n"'); do
+      J log -r "$c" --no-graph \
+        -T '"\n### " ++ change_id.short() ++ " " ++ if(description, description.first_line(), "(no description)") ++ "\n\n- change: " ++ change_id ++ "\n- commit: " ++ commit_id ++ "\n- parents: " ++ parents.map(|p| p.change_id().short()).join(" ") ++ "\n- author: " ++ author.name() ++ " " ++ author.timestamp().format("%Y-%m-%d %H:%M") ++ "\n\n" ++ description ++ "\n"'
+      printf '```diff\n'
+      J diff -r "$c" --git
+      printf '```\n'
+    done
+  } >"$file"
+
+  local c i=0
+  for c in $(J log -r "roots($revset)" --no-graph -T 'commit_id ++ "\n"'); do
+    git update-ref "refs/stash/$name/root-$((i++))" "$c"
+  done
+  i=0
+  for c in $(J log -r "heads($revset)" --no-graph -T 'commit_id ++ "\n"'); do
+    git update-ref "refs/stash/$name/head-$((i++))" "$c"
+  done
+  J bookmark list -r "$revset" -T 'name ++ " " ++ normal_target.commit_id() ++ "\n"' 2>/dev/null |
+    while read -r b c; do git update-ref "refs/stash/$name/bookmark/$b" "$c"; done
+
+  J abandon "$revset" >/dev/null
+  printf 'parked %s commits as %s\n  read: %s\n' "$count" "$name" "${file#"$main_root"/}"
+}
+
+pop() {
+  local name=$1
+  [ -n "$(git for-each-ref "refs/stash/$name/")" ] || die "no stash named $name"
+
+  # 1. Before anything is revived, note the current version of every parent
+  #    the roots sat on. Reviving brings the old versions back too, and then
+  #    change_id() would be ambiguous.
+  declare -A current
+  local root p ch now
+  while read -r root _; do
+    for p in $(git log -1 --format=%P "$root"); do
+      ch=$(git cat-file -p "$p" | sed -n 's/^change-id //p')
+      now=$(J log -r "present(change_id($ch)) ~ hidden()" --no-graph -T 'commit_id' 2>/dev/null || true)
+      current[$p]=${now:-$p}   # parent itself abandoned since: keep the original
+    done
+  done < <(refs_of "$name" 'root-*')
+
+  # 2. Revive the exact commits: a bookmark on a hidden commit makes it and its
+  #    ancestors visible again, and stays visible after the bookmark goes.
+  local head
+  while read -r head _; do
+    J bookmark create "jj-stash-tmp" -r "$head" >/dev/null
+    J bookmark delete "jj-stash-tmp" >/dev/null
+  done < <(refs_of "$name" 'head-*')
+
+  # 3. Any root whose parent was rewritten while parked moves onto the current
+  #    version; its descendants follow.
+  local args moved
+  while read -r root _; do
+    args=(); moved=
+    for p in $(git log -1 --format=%P "$root"); do
+      args+=(-o "${current[$p]}")
+      [ "${current[$p]}" = "$p" ] || moved=1
+    done
+    [ -z "$moved" ] || J rebase -s "$root" "${args[@]}" >/dev/null
+  done < <(refs_of "$name" 'root-*')
+
+  # 3b. Reviving brought back the OLD version of any parent that was rewritten
+  #     while parked (ancestors of a visible commit are visible). With the
+  #     chain moved off it, that copy is a childless duplicate of a live
+  #     change; abandon it. Only a childless one: anything else still has a
+  #     reason to be visible.
+  for p in "${!current[@]}"; do
+    [ "${current[$p]}" != "$p" ] || continue
+    if J log -r "$p & visible_heads()" --no-graph -T '"x"' 2>/dev/null | grep -q x; then
+      J abandon "$p" >/dev/null
+    fi
+  done
+
+  # 4. Bookmarks, by change ID so they follow a rebase.
+  local c b
+  while read -r c ref; do
+    b=${ref#"refs/stash/$name/bookmark/"}
+    ch=$(git cat-file -p "$c" | sed -n 's/^change-id //p')
+    J bookmark set "$b" -r "change_id($ch)" --allow-backwards >/dev/null
+  done < <(refs_of "$name" 'bookmark/*')
+
+  git for-each-ref --format='%(refname)' "refs/stash/$name/" | xargs -n1 git update-ref -d
+  rm -f "$stash_dir/$name.md"
+  printf 'restored %s\n' "$name"
+}
+
+list() {
+  local n
+  for n in $(git for-each-ref --format='%(refname)' 'refs/stash/*/head-0' | sed 's#refs/stash/##; s#/head-0##'); do
+    printf '%-24s %s\n' "$n" "$(sed -n 's/^- commits: /commits: /p; s/^- parked: /parked: /p' "$stash_dir/$n.md" 2>/dev/null | paste -sd' ' -)"
+  done
+}
+
+case ${1:-} in
+  push) [ $# -eq 3 ] || die "usage: jj-stash push NAME REVSET"; push "$2" "$3" ;;
+  pop)  [ $# -eq 2 ] || die "usage: jj-stash pop NAME"; pop "$2" ;;
+  show) [ $# -eq 2 ] || die "usage: jj-stash show NAME"; cat "$stash_dir/$2.md" ;;
+  list) list ;;
+  *) sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+esac

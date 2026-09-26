@@ -10,10 +10,10 @@ cannot filter by revset. VisualJJ 0.35.3 has no revset setting at all, so
 make commits invisible to jj itself.
 
 ```
-jj-stash push NAME 'REVSET'   park a chain (REVSET must include its own descendants)
-jj-stash list                 parked chains, one line each
-jj-stash show NAME            print the plaintext
-jj-stash pop NAME             bring the chain back and drop the stash
+jj-stash push NAME 'REVSET'        park a chain; children outside it are detached
+jj-stash list                      parked chains, with what each needs popped first
+jj-stash show NAME                 print the plaintext
+jj-stash pop [--with-deps] NAME    bring the chain back and drop the stash
 ```
 
 ## How a chain is parked
@@ -92,6 +92,44 @@ IDs and timestamps all survive, and an export/replay step is unnecessary.
 contains any workspace's working-copy commit, and one that contains immutable
 commits.
 
+## Dependencies between stashes
+
+`pop` only knows each root's *direct* parent. Stash a dangling commit, then
+the chain it dangles from, and the two now depend on each other in one
+direction. Popping them in the wrong order is where it goes wrong:
+
+- **Nothing rewritten in between:** reviving the dangling commit makes its
+  ancestors visible, so its parent comes back as an ancestor while the other
+  stash still claims it. That leaks into view. Edit the leaked commit, and
+  popping the chain later revives the old version beside the edit: divergence.
+- **An ancestor rewritten while both are parked:** the first pop revives the old
+  ancestor and it diverges at once. The second pop happens to repair it, but
+  the state in between is wrong.
+
+So a stash **depends** on another when one of its roots sits on a commit that is
+hidden and parked there, or when a child it detached (`reattach/`) is hidden
+and parked there. Membership is jj's `roots::heads` for each stash, computed
+with `git rev-list --ancestry-path`. That leaves out the ancestors of a merge's
+outside parent, which a plain `rev-list heads ^parents` would wrongly include.
+Everything is keyed by change ID, so it holds across rewrites.
+
+- `pop NAME` refuses while NAME depends on another stash, names it, and
+  changes nothing.
+- `pop --with-deps NAME` pops the dependencies first, recursively, then NAME. A
+  cycle is refused.
+- `push` prints a note for every existing stash that now depends on the new
+  one.
+- `list` shows a `needs:` column.
+
+Two alternatives were considered and not built. Restoring onto the *nearest
+visible ancestor* is easy to find but amounts to `jj abandon` of the missing
+link: the revision's diff conflicts wherever it depends on what the skipped
+commits introduced. Parking a *partial graph* (a middle commit with its
+descendants left visible) is impossible without rewriting those descendants,
+because a commit's parents are part of its identity. They would show as
+conflicted while parked. Parking related pieces as one stash, a union in one
+revset, avoids both.
+
 ## Tested
 
 Run against a copy of a real repo (jj 0.45.1, colocated, 131 mutable commits,
@@ -107,6 +145,11 @@ three workspaces):
 | `jj util gc --expire now` then `git gc --prune=now`, while parked | objects survive; pop works |
 | push from a secondary workspace nested under `.claude/worktrees/`, pop from the main one | plaintext lands in the main root, is ignored, and the main `@` is not snapshotted |
 | second push | does not re-append the exclude rule |
+| dangling commit parked, then the 16-commit chain it sits on | push of the chain notes the dependency; `pop` of the dangling one is refused and changes nothing; the right order restores identical IDs |
+| same, `pop --with-deps` on the dangling one | pops the chain, then it; identical IDs; no refs left |
+| a lane that feeds a merge parked, then the merge's line | popping the lane first is refused (its reattach target is parked); `--with-deps` restores the line, then the merge gets the lane back as a parent |
+| real stashes, parked by hand in the wrong order (a PR lane, then the readme lane it sits on) | found by `list`; `pop` refused; `--with-deps` restores both, PR back on the readme commit |
+| an independent stash | pops without `--with-deps`; no false dependency across 27 real stashes |
 
 ## Limits
 
@@ -124,6 +167,9 @@ three workspaces):
   merge commit inside the chain has a parent outside it, and that parent is
   rewritten while parked, the old version of that parent comes back.
 - **Conflicted bookmarks** (more than one target) are not recorded.
+- **Dependency cycles** are refused, but no real cycle was found to test it.
+  Chains deeper than one level (A needs B needs C) are handled by the same
+  recursion but were not tested directly.
 
 ## Found by testing
 
@@ -135,6 +181,12 @@ three workspaces):
 - An ignore check run relative to a secondary workspace under
   `.claude/worktrees/` matched that directory's own ignore rule. The plaintext
   then went unignored and jj snapshotted it.
+- Under `set -e` and `pipefail`, a dependency check whose last test came out
+  false returned non-zero and would have aborted the script from inside
+  `$(...)`.
+- `list` took 38 seconds over 27 stashes: the ownership map was built inside
+  a `$(...)` subshell, thrown away, and rebuilt per stash. It is now built
+  once in the main shell, which the subshells inherit (2.3 seconds).
 
 ## If this became `jj stash`
 

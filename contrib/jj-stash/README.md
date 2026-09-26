@@ -12,7 +12,8 @@ make commits invisible to jj itself.
 ```
 jj-stash push NAME 'REVSET'        park a chain; children outside it are detached
 jj-stash list                      parked chains, with what each needs popped first
-jj-stash show NAME                 print the plaintext
+jj-stash index                     rewrite .claude/stashes/INDEX.md now
+jj-stash show NAME                 the plaintext, under a live needs / needed-by header
 jj-stash pop [--with-deps] NAME    bring the chain back and drop the stash
 ```
 
@@ -26,8 +27,12 @@ Two things are written, then the chain is abandoned:
   so the chain can be read before deciding whether and when to bring it back.
   It doubles as a fallback patch. It lives in the main repo's root, whichever
   workspace `push` runs from, and must be ignored or jj would snapshot it into
-  `@`: if nothing ignores `.claude/stashes/`, the script adds it to
-  `.git/info/exclude`.
+  `@`. `.claude/stashes/` always goes in `.git/info/exclude`, even when a
+  committed `.gitignore` covers it too. jj reads ignore rules from the files on
+  disk, so checking out a commit older than that `.gitignore` rule would
+  snapshot every stash file into it, and moving off that commit would delete
+  them from disk. The exclude file is local and holds whichever commit is
+  checked out.
 - **`refs/jj-stash/NAME/{root-N,head-N,bookmark/<name>,reattach/<change>/N}`,
   git refs.** These keep
   the commits alive. jj imports only `refs/heads`, `refs/tags` and
@@ -121,6 +126,19 @@ Everything is keyed by change ID, so it holds across rewrites.
   one.
 - `list` shows a `needs:` column.
 
+Dependencies are never written into a stash's own file. They change whenever
+another stash is parked or popped, so text fixed at park time goes stale the
+first time anything else moves. They are shown where they are worked out
+fresh:
+
+- **`show NAME`** prints `> needs:` and `> needed by:` above the file,
+  computed at that moment.
+- **`.claude/stashes/INDEX.md`** is rewritten after every `push` and `pop`,
+  which are the only things that change what is parked. It has one row per
+  stash: a link to its file, commit count, when it was parked, what it sits on,
+  and what it needs. It is ignored along with the rest of the directory, and
+  `INDEX` is refused as a stash name. `jj-stash index` rewrites it on demand.
+
 Two alternatives were considered and not built. Restoring onto the *nearest
 visible ancestor* is easy to find but amounts to `jj abandon` of the missing
 link: the revision's diff conflicts wherever it depends on what the skipped
@@ -145,6 +163,10 @@ three workspaces):
 | `jj util gc --expire now` then `git gc --prune=now`, while parked | objects survive; pop works |
 | push from a secondary workspace nested under `.claude/worktrees/`, pop from the main one | plaintext lands in the main root, is ignored, and the main `@` is not snapshotted |
 | second push | does not re-append the exclude rule |
+| `show` on a real dependent pair | `pr-88`: needs `docs-readme`, needed by nothing; `docs-readme`: needs nothing, needed by `pr-88`; unknown name fails cleanly |
+| `index` over 28 real stashes | one row each; the dependent row carries its commit count, the commit it sits on and `docs-readme`; independent rows have an empty needs cell |
+| `push` / `pop` / `pop --with-deps` | the index gains and loses rows to match; afterwards no row needs anything; a stash named `INDEX` is refused |
+| checking out a commit older than the `.gitignore` rule, then back | stash files stay ignored through `.git/info/exclude`, nothing is snapshotted into `@`, every file is still on disk afterwards |
 | dangling commit parked, then the 16-commit chain it sits on | push of the chain notes the dependency; `pop` of the dangling one is refused and changes nothing; the right order restores identical IDs |
 | same, `pop --with-deps` on the dangling one | pops the chain, then it; identical IDs; no refs left |
 | a lane that feeds a merge parked, then the merge's line | popping the lane first is refused (its reattach target is parked); `--with-deps` restores the line, then the merge gets the lane back as a parent |
@@ -184,6 +206,11 @@ three workspaces):
 - Under `set -e` and `pipefail`, a dependency check whose last test came out
   false returned non-zero and would have aborted the script from inside
   `$(...)`.
+- The stash files were protected only by the committed `.gitignore`. A test
+  copy of the repo built without its working tree had no `.gitignore` on disk,
+  so jj snapshotted all 28 stash files into `@`, and moving `@` deleted them.
+  The real repo was unaffected, but any checkout older than the rule would
+  have done the same there. `.git/info/exclude` now always carries it.
 - `list` took 38 seconds over 27 stashes: the ownership map was built inside
   a `$(...)` subshell, thrown away, and rebuilt per stash. It is now built
   once in the main shell, which the subshells inherit (2.3 seconds).

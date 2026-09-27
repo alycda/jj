@@ -10,6 +10,8 @@
 #                               bring the chain back and drop the stash; refuses
 #                               while it sits on another stash, unless
 #                               --with-deps pops that one first
+#   jj-stash drop NAME          forget the stash without restoring it; refuses
+#                               while another stash sits on it
 #
 # A parked chain is two things:
 #   .claude/stashes/NAME.md
@@ -401,6 +403,33 @@ or pop them all in order with: jj-stash pop --with-deps $name"
   owner=(); owners_loaded=
 }
 
+# Forget a stash: delete its refs and plaintext, leave the commits abandoned.
+# Refuses while another stash depends on it. That stash's roots sit on commits
+# in this one, and pop revives a chain by pointing a bookmark at its heads,
+# which makes every ancestor visible: popping it would silently bring the
+# dropped commits back.
+#
+# Without the refs, only jj's own operation log keeps the commits from git gc,
+# so they stay recoverable by commit ID until `jj util gc` expires them. The
+# heads are printed for that.
+drop() {
+  local name=$1 by heads count
+  [ -n "$(git for-each-ref "refs/jj-stash/$name/")" ] || die "no stash named $name"
+  load_owners
+  by=$(needed_by "$name")
+  [ -z "$by" ] || die "these stashes sit on commits in $name; popping them later would bring $name back:
+$(printf '  %s\n' $by)
+drop or pop them first"
+
+  heads=$(refs_of "$name" 'head-*' | cut -d' ' -f1)
+  count=$(members "$name" | wc -l | tr -d ' ')
+  git for-each-ref --format='%(refname)' "refs/jj-stash/$name/" | xargs -n1 git update-ref -d
+  rm -f "$stash_dir/$name.md"
+  printf 'dropped %s (%s commits)\n  until jj util gc, recover with: jj new %s\n' \
+    "$name" "$count" "$(printf '%s\n' $heads | cut -c1-12 | paste -sd' ' -)"
+  owner=(); owners_loaded=
+}
+
 list() {
   local n
   load_owners
@@ -419,8 +448,9 @@ case ${1:-} in
     elif [ $# -eq 2 ]; then pop "$2"
     else die "usage: jj-stash pop [--with-deps] NAME"; fi
     write_index ;;
+  drop) [ $# -eq 2 ] || die "usage: jj-stash drop NAME"; drop "$2"; write_index ;;
   show) [ $# -eq 2 ] || die "usage: jj-stash show NAME"; show "$2" ;;
   index) write_index; printf 'wrote %s\n' "${stash_dir#"$main_root"/}/INDEX.md" ;;
   list) list ;;
-  *) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+  *) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac

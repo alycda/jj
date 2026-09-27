@@ -15,6 +15,7 @@ jj-stash list                      parked chains, with what each needs popped fi
 jj-stash index                     rewrite .claude/stashes/INDEX.md now
 jj-stash show NAME                 the plaintext, under a live needs / needed-by header
 jj-stash pop [--with-deps] NAME    bring the chain back and drop the stash
+jj-stash drop NAME                 forget the stash without bringing it back
 ```
 
 ## How a chain is parked
@@ -148,6 +149,23 @@ because a commit's parents are part of its identity. They would show as
 conflicted while parked. Parking related pieces as one stash, a union in one
 revset, avoids both.
 
+## Dropping a stash
+
+`drop NAME` forgets a stash without restoring it: it deletes the refs and the
+plaintext and rewrites the index. The commits stay abandoned.
+
+Deleting `NAME.md` by hand is not enough. The refs are the stash; `list`, `pop`
+and `index` find stashes by them, so the stash stays, with blank columns.
+Deleting the refs by hand is worse when another stash depends on this one. That
+stash no longer shows the dependency, so its `pop` goes ahead, and reviving its
+head makes every ancestor visible: the dropped commits come back with it. So
+`drop` refuses while any stash needs NAME, names them, and changes nothing. Drop
+or pop those first.
+
+Without the refs, only jj's operation log keeps the commits from git gc. `drop`
+prints `jj new <head>` for each head, which brings the chain back until
+`jj util gc` expires it.
+
 ## Tested
 
 Run against a copy of a real repo (jj 0.45.1, colocated, 131 mutable commits,
@@ -172,6 +190,9 @@ three workspaces):
 | a lane that feeds a merge parked, then the merge's line | popping the lane first is refused (its reattach target is parked); `--with-deps` restores the line, then the merge gets the lane back as a parent |
 | real stashes, parked by hand in the wrong order (a PR lane, then the readme lane it sits on) | found by `list`; `pop` refused; `--with-deps` restores both, PR back on the readme commit |
 | an independent stash | pops without `--with-deps`; no false dependency across 27 real stashes |
+| `drop` of an independent stash | refs, plaintext, index row and `list` line gone; commit hidden but still in the store; the printed `jj new` brings it back |
+| `drop` of a stash another sits on (`docs-readme`, needed by `pr-88`) | refused, naming `pr-88`; nothing changed. Dropping `pr-88` first, then `docs-readme`, works |
+| `drop` with an unknown name, no name, or an extra argument | fails; nothing changed |
 
 ## Limits
 

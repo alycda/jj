@@ -159,8 +159,14 @@ and `index` find stashes by them, so the stash stays, with blank columns.
 Deleting the refs by hand is worse when another stash depends on this one. That
 stash no longer shows the dependency, so its `pop` goes ahead, and reviving its
 head makes every ancestor visible: the dropped commits come back with it. So
-`drop` refuses while any stash needs NAME, names them, and changes nothing. Drop
-or pop those first.
+`drop` refuses while another stash's roots sit on commits in NAME, names them,
+and changes nothing. Drop or pop those first.
+
+The other kind of dependency does not block a drop. A stash that was detached
+from a commit in NAME, typically a lane cut out of a merge that NAME holds,
+only loses the chance to rejoin it: its `pop` skips a child that no longer
+exists, says so, and brings back nothing of NAME. `drop` goes ahead and lists
+those stashes in a note.
 
 Without the refs, only jj's operation log keeps the commits from git gc. `drop`
 prints `jj new <head>` for each head, which brings the chain back until
@@ -193,6 +199,7 @@ three workspaces):
 | `drop` of an independent stash | refs, plaintext, index row and `list` line gone; commit hidden but still in the store; the printed `jj new` brings it back |
 | `drop` of a stash another sits on (`docs-readme`, needed by `pr-88`) | refused, naming `pr-88`; nothing changed. Dropping `pr-88` first, then `docs-readme`, works |
 | `drop` with an unknown name, no name, or an extra argument | fails; nothing changed |
+| `drop` of the stash holding a review merge that 18 parked issue lanes were detached from | not refused; a note lists all 18; a lane then pops without `--with-deps`, says the merge was not reattached, and the merge stays hidden |
 
 ## Limits
 

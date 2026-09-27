@@ -125,19 +125,21 @@ visible_change() {
   [ -n "$(J log -r "present(change_id($1)) ~ hidden()" --no-graph -T '"x"' 2>/dev/null)" ]
 }
 
-# The stashes NAME needs popped first, one per line.
+# The stashes NAME needs popped first, one per line. KIND narrows it to one of
+# the two reasons: roots (a root sits on a commit parked there) or reattach (a
+# detached child is parked there). drop tells them apart.
 deps_of() {
-  local name=$1 root p ch
+  local name=$1 kind=${2:-all} root p ch
   load_owners
   {
-    while read -r root _; do
+    [ "$kind" = reattach ] || while read -r root _; do
       for p in $(git log -1 --format=%P "$root"); do
         ch=$(change_of "$p")
         [ -n "${owner[$ch]:-}" ] && [ "${owner[$ch]}" != "$name" ] && ! visible_change "$ch" &&
           printf '%s\n' "${owner[$ch]}"
       done
     done < <(refs_of "$name" 'root-*')
-    for ch in $(git for-each-ref --format='%(refname)' "refs/jj-stash/$name/reattach/" |
+    [ "$kind" = roots ] || for ch in $(git for-each-ref --format='%(refname)' "refs/jj-stash/$name/reattach/" |
       sed "s#refs/jj-stash/$name/reattach/##; s#/[0-9]*\$##" | sort -u); do
       [ -n "${owner[$ch]:-}" ] && [ "${owner[$ch]}" != "$name" ] && ! visible_change "$ch" &&
         printf '%s\n' "${owner[$ch]}"
@@ -146,12 +148,12 @@ deps_of() {
   } | sort -u
 }
 
-# The stashes that need NAME popped first, one per line.
+# The stashes that need NAME popped first, one per line; KIND as for deps_of.
 needed_by() {
   local other
   for other in $(stash_names); do
     [ "$other" = "$1" ] && continue
-    deps_of "$other" | grep -qxF "$1" && printf '%s\n' "$other"
+    deps_of "$other" "${2:-all}" | grep -qxF "$1" && printf '%s\n' "$other"
   done
   true
 }
@@ -404,22 +406,25 @@ or pop them all in order with: jj-stash pop --with-deps $name"
 }
 
 # Forget a stash: delete its refs and plaintext, leave the commits abandoned.
-# Refuses while another stash depends on it. That stash's roots sit on commits
-# in this one, and pop revives a chain by pointing a bookmark at its heads,
-# which makes every ancestor visible: popping it would silently bring the
-# dropped commits back.
+# Refuses while another stash's roots sit on commits in this one: pop revives a
+# chain by pointing a bookmark at its heads, which makes every ancestor
+# visible, so popping that stash would silently bring the dropped commits back.
+# A stash that only detached a child now parked here (a lane cut out of a
+# merge) is no reason to refuse: its pop skips a child that no longer exists
+# and brings back nothing of this stash. That is only warned about.
 #
 # Without the refs, only jj's own operation log keeps the commits from git gc,
 # so they stay recoverable by commit ID until `jj util gc` expires them. The
 # heads are printed for that.
 drop() {
-  local name=$1 by heads count
+  local name=$1 by lose heads count
   [ -n "$(git for-each-ref "refs/jj-stash/$name/")" ] || die "no stash named $name"
   load_owners
-  by=$(needed_by "$name")
+  by=$(needed_by "$name" roots)
   [ -z "$by" ] || die "these stashes sit on commits in $name; popping them later would bring $name back:
 $(printf '  %s\n' $by)
 drop or pop them first"
+  lose=$(needed_by "$name" reattach)
 
   heads=$(refs_of "$name" 'head-*' | cut -d' ' -f1)
   count=$(members "$name" | wc -l | tr -d ' ')
@@ -427,6 +432,8 @@ drop or pop them first"
   rm -f "$stash_dir/$name.md"
   printf 'dropped %s (%s commits)\n  until jj util gc, recover with: jj new %s\n' \
     "$name" "$count" "$(printf '%s\n' $heads | cut -c1-12 | paste -sd' ' -)"
+  [ -z "$lose" ] || printf 'note: these were detached from commits in %s and will pop without being reattached:\n%s\n' \
+    "$name" "$(printf '  %s\n' $lose)" >&2
   owner=(); owners_loaded=
 }
 

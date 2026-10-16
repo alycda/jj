@@ -242,6 +242,12 @@ three workspaces):
 - `list` took 38 seconds over 27 stashes: the ownership map was built inside
   a `$(...)` subshell, thrown away, and rebuilt per stash. It is now built
   once in the main shell, which the subshells inherit (2.3 seconds).
+- A stash root sitting on a commit that git made, a squash merge from GitHub,
+  had no `change-id` header. `change_of` returned nothing, and bash 5.2 and
+  later reject an empty key for an associative array, so `push` printed
+  `owner: bad array subscript` from the dependency check. jj derives a change
+  ID for such commits from the commit ID, so `change_of` now asks jj when the
+  header is missing, and an empty ID is skipped rather than indexed.
 
 ## If this became `jj stash`
 

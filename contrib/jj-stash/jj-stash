@@ -83,7 +83,15 @@ refs_of() { git for-each-ref --format='%(objectname) %(refname)' "refs/jj-stash/
 # pop refuses until its dependencies are popped, or pops them first with
 # --with-deps. Everything is keyed by change ID, so it holds across rewrites.
 
-change_of() { git cat-file -p "$1" | sed -n 's/^change-id //p'; }
+# A commit's change ID. jj writes one as a header into every commit it creates.
+# A commit git made, such as a squash merge from GitHub, has no header, and jj
+# derives its change ID from the commit ID instead, so ask jj for those.
+change_of() {
+  local id
+  id=$(git cat-file -p "$1" | sed -n 's/^change-id //p')
+  [ -n "$id" ] || id=$(J log -r "$1" --no-graph -T change_id 2>/dev/null)
+  printf '%s\n' "$id"
+}
 
 stash_names() {
   git for-each-ref --format='%(refname)' 'refs/jj-stash/*/head-0' |
@@ -114,9 +122,12 @@ declare -A owner
 owners_loaded=
 load_owners() {
   [ -n "$owners_loaded" ] && return
-  local n c
+  local n c ch
   for n in $(stash_names); do
-    for c in $(members "$n"); do owner[$(change_of "$c")]=$n; done
+    for c in $(members "$n"); do
+      ch=$(change_of "$c")
+      [ -n "$ch" ] && owner[$ch]=$n
+    done
   done
   owners_loaded=1
 }
@@ -135,6 +146,7 @@ deps_of() {
     [ "$kind" = reattach ] || while read -r root _; do
       for p in $(git log -1 --format=%P "$root"); do
         ch=$(change_of "$p")
+        [ -n "$ch" ] || continue
         [ -n "${owner[$ch]:-}" ] && [ "${owner[$ch]}" != "$name" ] && ! visible_change "$ch" &&
           printf '%s\n' "${owner[$ch]}"
       done

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # show / INDEX.md / exclude tests for jj-stash, run inside the lab copy only.
+# shellcheck disable=SC2016,SC2034,SC2001,SC2012  # the checks are strings that check() evals later: their single quotes are deliberate, and the variables they read look unused
 set -uo pipefail
 S=${S:?}
 case $PWD in */scratchpad/lab) ;; *) echo "refusing: not in the lab ($PWD)"; exit 1 ;; esac

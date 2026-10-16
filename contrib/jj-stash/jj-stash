@@ -40,6 +40,7 @@
 # reads ignore rules from the files on disk, so checking out a commit older
 # than that .gitignore rule would snapshot every stash file into it, and moving
 # off that commit would then delete them.
+# shellcheck disable=SC2016  # the backticks in printed text are Markdown, not commands
 set -euo pipefail
 
 J() { jj --no-pager "$@"; }
@@ -327,7 +328,7 @@ pop() {
   deps=$(deps_of "$name")
   if [ -n "$deps" ]; then
     [ -n "$with_deps" ] || die "$name sits on commits parked in another stash; pop that first:
-$(printf '  jj-stash pop %s\n' $deps)
+$(printf "%s\n" "$deps" | sed "s/^/  jj-stash pop /")
 or pop them all in order with: jj-stash pop --with-deps $name"
     popping+=" $name"
     for d in $deps; do
@@ -434,7 +435,7 @@ drop() {
   load_owners
   by=$(needed_by "$name" roots)
   [ -z "$by" ] || die "these stashes sit on commits in $name; popping them later would bring $name back:
-$(printf '  %s\n' $by)
+$(printf "%s\n" "$by" | sed "s/^/  /")
 drop or pop them first"
   lose=$(needed_by "$name" reattach)
 
@@ -443,9 +444,9 @@ drop or pop them first"
   git for-each-ref --format='%(refname)' "refs/jj-stash/$name/" | xargs -n1 git update-ref -d
   rm -f "$stash_dir/$name.md"
   printf 'dropped %s (%s commits)\n  until jj util gc, recover with: jj new %s\n' \
-    "$name" "$count" "$(printf '%s\n' $heads | cut -c1-12 | paste -sd' ' -)"
+    "$name" "$count" "$(printf "%s\n" "$heads" | cut -c1-12 | paste -sd' ' -)"
   [ -z "$lose" ] || printf 'note: these were detached from commits in %s and will pop without being reattached:\n%s\n' \
-    "$name" "$(printf '  %s\n' $lose)" >&2
+    "$name" "$(printf "%s\n" "$lose" | sed "s/^/  /")" >&2
   owner=(); owners_loaded=
 }
 
